@@ -53,5 +53,3 @@ snakemake --use-conda --cores 16 -p
 MIT (see `LICENSE`).
 
 ```
-
----
