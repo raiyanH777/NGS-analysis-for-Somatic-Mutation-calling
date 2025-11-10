@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =========================
+# CONFIGURATION PARAMETERS
+# =========================
+THREADS=16
+REF_DIR="resources/reference"
+ADAPTERS="resources/adapters/TruSeq3-PE-2.fa"
+REF_FA="${REF_DIR}/wg.fa"
+REF_DICT="${REF_DIR}/wg.dict"
+BWA_IDX_PREFIX="${REF_DIR}/hg38bwaidx"
+GERMLINE="${REF_DIR}/somatic-hg38_af-only-gnomad.hg38.vcf.gz"
+PON="${REF_DIR}/somatic-hg38_1000g_pon.hg38.vcf.gz"
+
+# Sample IDs (edit these to match your dataset)
+NORMAL_ID="DU_001"
+TUMOR_ID="DU_T_001"
+PAIR_ID="P001"
+
+# FASTQs
+NORMAL_R1="data/fastq/${NORMAL_ID}_1.fastq.gz"
+NORMAL_R2="data/fastq/${NORMAL_ID}_2.fastq.gz"
+TUMOR_R1="data/fastq/${TUMOR_ID}_1.fastq.gz"
+TUMOR_R2="data/fastq/${TUMOR_ID}_2.fastq.gz"
+
+# Output directories
+mkdir -p results/{trimmed,bam,qc/fastqc,mutect2,vcfqc,pon}
+
+# ================
+# 1. TRIMMING
+# ================
+echo "### STEP 1: Running Trimmomatic"
+trimmomatic PE -threads ${THREADS} \
+  ${NORMAL_R1} ${NORMAL_R2} \
+  results/trimmed/${NORMAL_ID}_R1.trim.fastq.gz results/trimmed/${NORMAL_ID}_R1.unpaired.fastq.gz \
+  results/trimmed/${NORMAL_ID}_R2.trim.fastq.gz results/trimmed/${NORMAL_ID}_R2.unpaired.fastq.gz \
+  ILLUMINACLIP:${ADAPTERS}:2:30:10:2 SLIDINGWINDOW:4:20 MINLEN:25
+
+trimmomatic PE -threads ${THREADS} \
+  ${TUMOR_R1} ${TUMOR_R2} \
+  results/trimmed/${TUMOR_ID}_R1.trim.fastq.gz results/trimmed/${TUMOR_ID}_R1.unpaired.fastq.gz \
+  results/trimmed/${TUMOR_ID}_R2.trim.fastq.gz results/trimmed/${TUMOR_ID}_R2.unpaired.fastq.gz \
+  ILLUMINACLIP:${ADAPTERS}:2:30:10:2 SLIDINGWINDOW:4:20 MINLEN:25
+
+# ================
+# 2. FASTQC
+# ================
+echo "### STEP 2: Running FastQC"
+fastqc results/trimmed/${NORMAL_ID}_R1.trim.fastq.gz results/trimmed/${NORMAL_ID}_R2.trim.fastq.gz -o results/qc/fastqc/
+fastqc results/trimmed/${TUMOR_ID}_R1.trim.fastq.gz results/trimmed/${TUMOR_ID}_R2.trim.fastq.gz -o results/qc/fastqc/
+
+# ================
+# 3. ALIGNMENT
+# ================
+echo "### STEP 3: Aligning reads with BWA-MEM"
+bwa mem -t ${THREADS} ${BWA_IDX_PREFIX} \
+  results/trimmed/${NORMAL_ID}_R1.trim.fastq.gz results/trimmed/${NORMAL_ID}_R2.trim.fastq.gz \
+  | samtools view -Sb - > results/bam/${NORMAL_ID}.unsorted.bam
+
+bwa mem -t ${THREADS} ${BWA_IDX_PREFIX} \
+  results/trimmed/${TUMOR_ID}_R1.trim.fastq.gz results/trimmed/${TUMOR_ID}_R2.trim.fastq.gz \
+  | samtools view -Sb - > results/bam/${TUMOR_ID}.unsorted.bam
+
+# ================
+# 4. POST-PROCESSING
+# ================
+echo "### STEP 4: Sorting, adding read groups, and marking duplicates"
+for SAMPLE in ${NORMAL_ID} ${TUMOR_ID}; do
+  gatk AddOrReplaceReadGroups \
+    -I results/bam/${SAMPLE}.unsorted.bam \
+    -O results/bam/${SAMPLE}.rg.bam \
+    --RGID 1 --RGLB lib1 --RGPL illumina --RGPU unit1 --RGSM ${SAMPLE}
+
+  samtools sort -@ ${THREADS} results/bam/${SAMPLE}.rg.bam -o results/bam/${SAMPLE}.sorted.bam
+  sambamba markdup -r results/bam/${SAMPLE}.sorted.bam results/bam/${SAMPLE}.final_sorted_deduped.bam
+done
+
+# ================
+# 5. MUTECT2 CALLING
+# ================
+echo "### STEP 5: Running Mutect2 (Tumor–Normal)"
+gatk Mutect2 \
+  -R ${REF_FA} \
+  -I results/bam/${TUMOR_ID}.final_sorted_deduped.bam \
+  -I results/bam/${NORMAL_ID}.final_sorted_deduped.bam \
+  -normal ${NORMAL_ID} \
+  --germline-resource ${GERMLINE} \
+  --panel-of-normals ${PON} \
+  -O results/mutect2/${PAIR_ID}.somatic.vcf.gz
+
+# ================
+# 6. FILTER MUTECT CALLS
+# ================
+echo "### STEP 6: Filtering Mutect2 calls"
+gatk FilterMutectCalls \
+  -R ${REF_FA} \
+  -V results/mutect2/${PAIR_ID}.somatic.vcf.gz \
+  -O results/mutect2/${PAIR_ID}.somatic.filtered.vcf.gz
+
+# ================
+# 7. VCF QC (optional)
+# ================
+echo "### STEP 7: VCF QC metrics"
+vcftools --gzvcf results/mutect2/${PAIR_ID}.somatic.filtered.vcf.gz \
+  --site-quality --out results/vcfqc/${PAIR_ID}_sitequality
+
+echo "### DONE — Somatic variant calling complete!"
+echo "Filtered VCF: results/mutect2/${PAIR_ID}.somatic.filtered.vcf.gz"
